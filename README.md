@@ -65,17 +65,16 @@ Rack 作为 web server 与应用框架之间的桥梁.
 
 我们先来看一下[rack 协议](https://github.com/rack/rack/blob/master/SPEC.rdoc)
 
-所有的 webserver 只需要在 Rack::Handler 的模块中创建一个实现了 .run 方法的类就可以了：
-
-一个 Rack 应用是一个 Ruby 的对象(object), 而不是一个类(class).
-这个对象需要实现`call`方法;
-
-call 方法`只有一个`参数 `env` 环境, 并且要返回一个数组, 数组必须返回是三个值.
-HTTP 的 status , headers, 和 body;
+- 对于 `web server`: 只需要在 `Rack::Handler` 的模块中创建一个实现了 `run` 方法的类就可以了
+- 对于 `web 框架`: 需要有一个 Ruby 的对象(注意不是类). 这个对象需要实现`call`方法.
+  - call 方法`只有一个`参数 `env` 环境
+  - 返回一个数组, 数组必须返回是三个值. 分别是 HTTP 的 status , headers, 和 body
 
 > Rack 的协议脱胎于 python 的[pep-0333 Python Web Server Gateway Interface](https://www.python.org/dev/peps/pep-0333/)
 
-我们可以看一个小案例, 要确保已安装了 `rack` 和 `puma`
+我们可以看一个小案例, 来看一下具体的情况;
+
+要确保已安装了 `rack` 和 `puma`
 
 我们在 `config.ru` 简单写一个处理请求的 rack 对象
 
@@ -126,18 +125,169 @@ load Gem.activate_bin_path('rack', 'rackup', version)
 => "D:/env/ruby/Ruby26-x64/lib/ruby/gems/2.6.0/gems/rack-2.2.3/bin/rackup"
 ```
 
-```rb
-def self.new_from_string(builder_script, file = "(rackup)")
-      # We want to build a variant of TOPLEVEL_BINDING with self as a Rack::Builder instance.
-      # We cannot use instance_eval(String) as that would resolve constants differently.
-      binding, builder = TOPLEVEL_BINDING.eval('Rack::Builder.new.instance_eval { [binding, self] }')
-      eval builder_script, binding, file
+我们找到对应的`bin/rackup`的代码
 
-      return builder.to_app
+```rb
+require "rack"
+Rack::Server.start
+```
+
+我们在 pry 中看一下具体执行的位置
+
+```sh
+[1] pry(main)> require "rack"
+=> true
+[2] pry(main)> show-source Rack::Server.start
+
+From: D:/env/ruby/Ruby26-x64/lib/ruby/gems/2.6.0/gems/rack-2.2.3/lib/rack/server.rb @ line 167:
+Owner: #<Class:Rack::Server>
+Visibility: public
+Number of lines: 3
+
+def self.start(options = nil)
+  new(options).start
 end
 ```
 
-- rack 中间件
+我们再看一下代码`lib/rack/server.rb`
+
+```rb
+def self.start(options = nil)
+  new(options).start
+end
+
+def start(&block)
+  # 调用server.run
+  server.run(wrapped_app, **options, &block)
+end
+
+# 我们没有传server的参数, 因此会去尝试默认的server
+def server
+  @_server ||= Rack::Handler.get(options[:server])
+
+  unless @_server
+    # SERVER_NAMES = %w(puma falcon webrick).freeze
+    @_server = Rack::Handler.default
+
+    # We already speak FastCGI
+    @ignore_options = [:File, :Port] if @_server.to_s == 'Rack::Handler::FastCGI'
+  end
+
+  @_server
+end
+```
+
+```sh
+[3] pry(main)> Rack::Handler.default
+=> Rack::Handler::Puma
+```
+
+我们可以看到, server 的值是 `Rack::Handler::Puma`
+
+那么, 最终的效果是
+
+```rb
+Rack::Handler::Puma.run(wrapped_app, **options, &block)
+```
+
+参数 `wrapped_app` 是一个非常重要的参数, 里面包含了中间件.
+我们接下来, 好好看一下!
+
+#### rack 中间件
+
+```rb
+def wrapped_app
+  @wrapped_app ||= build_app app
+end
+
+# options 方法是一个hash对象, 是一些配置, 如果不传, 则取默认配置
+def build_app(app)
+  middleware[options[:environment]].reverse_each do |middleware|
+    middleware = middleware.call(self) if middleware.respond_to?(:call)
+    next unless middleware
+    klass, *args = middleware
+    app = klass.new(app, *args)
+  end
+  app
+end
+
+def app
+  @app ||= options[:builder] ? build_app_from_string : build_app_and_options_from_config
+end
+
+private
+  def build_app_and_options_from_config
+    if !::File.exist? options[:config]
+      abort "configuration #{options[:config]} not found"
+    end
+    # 默认的文件是 config.ru
+    return Rack::Builder.parse_file(self.options[:config])
+  end
+```
+
+通过上述代码, 可以知道方法 app 的返回结果是通过解析`config.ru`文件获取的
+
+```rb
+Rack::Builder.parse_file('config.ru')
+```
+
+```rb
+# Initialize a new Rack::Builder instance.  +default_app+ specifies the
+# default application if +run+ is not called later.  If a block
+# is given, it is evaluted in the context of the instance.
+def initialize(default_app = nil, &block)
+  @use, @map, @run, @warmup, @freeze_app = [], nil, default_app, nil, false
+  instance_eval(&block) if block_given?
+end
+```
+
+`instance_eval(&block)` 通过 ruby 的元编程, 从而以`Rack::Builder`实例对象, 来调用`config.ru`中的代码;
+
+```rb
+APP = ->(env) { [200, {}, [env.inspect]] }
+use Rack::CommonLogger
+run ->(env) { APP.call(env) }
+```
+
+等价于
+
+```rb
+app = Rack::Builder.new
+APP = ->(env) { [200, {}, [env.inspect]] }
+# 添加要使用的中间件
+app.use Rack::CommonLogger
+# 这里的 run 和 Rack::Handler::Puma.run 只是同样的名字
+app.run APP
+```
+
+```rb
+# Specifies middleware to use in a stack.
+#
+#   class Middleware
+#     def initialize(app)
+#       @app = app
+#     end
+#
+#     def call(env)
+#       env["rack.some_header"] = "setting an example"
+#       @app.call(env)
+#     end
+#   end
+#
+#   use Middleware
+#   run lambda { |env| [200, { "Content-Type" => "text/plain" }, ["OK"]] }
+#
+# All requests through to this application will first be processed by the middleware class.
+# The +call+ method in this example sets an additional environment key which then can be
+# referenced in the application if required.
+def use(middleware, *args, &block)
+  if @map
+    mapping, @map = @map, nil
+    @use << proc { |app| generate_map(app, mapping) }
+  end
+  @use << proc { |app| middleware.new(app, *args, &block) }
+end
+```
 
 ## puma
 
@@ -154,6 +304,7 @@ end
 ```
 
 puma-master\lib\rack\handler\puma.rb
+
 所有遵循 Rack 协议的 webserver 都会实现上述 .run 方法接受 app、options 和一个 block 作为参数运行一个进程来处理所有的来自用户的 HTTP 请求，在这里就是每个 webserver 自己需要解决的了
 
 ```rb
