@@ -231,6 +231,8 @@ private
 Rack::Builder.parse_file('config.ru')
 ```
 
+`parse_file` 的方法调用栈较深, 简化后的代码如下
+
 ```rb
 # Initialize a new Rack::Builder instance.  +default_app+ specifies the
 # default application if +run+ is not called later.  If a block
@@ -256,56 +258,72 @@ app = Rack::Builder.new
 APP = ->(env) { [200, {}, [env.inspect]] }
 # 添加要使用的中间件
 app.use Rack::CommonLogger
-# 这里的 run 和 Rack::Handler::Puma.run 只是同样的名字
+# 这里的 run 和 Rack::Handler::Puma.run 不同
 app.run APP
 ```
 
+`use` 方法其实很简单就是向一个数组中加入中间件的类.
+
+我们在 config.ru 中加入一个自定义的两个中间件试一下
+
 ```rb
-# Specifies middleware to use in a stack.
-#
-#   class Middleware
-#     def initialize(app)
-#       @app = app
-#     end
-#
-#     def call(env)
-#       env["rack.some_header"] = "setting an example"
-#       @app.call(env)
-#     end
-#   end
-#
-#   use Middleware
-#   run lambda { |env| [200, { "Content-Type" => "text/plain" }, ["OK"]] }
-#
-# All requests through to this application will first be processed by the middleware class.
-# The +call+ method in this example sets an additional environment key which then can be
-# referenced in the application if required.
-def use(middleware, *args, &block)
-  if @map
-    mapping, @map = @map, nil
-    @use << proc { |app| generate_map(app, mapping) }
+APP = ->(env) { [200, {}, [env.inspect]] }
+
+class PutsMiddleware
+  def initialize(app)
+    @app = app
   end
-  @use << proc { |app| middleware.new(app, *args, &block) }
+
+  def call(env)
+    puts 'middleware 1 --- before request'
+    response = @app.call(env)
+    puts 'middleware 1 --- after response'
+    response
+  end
 end
+
+class PutsMiddleware2
+  def initialize(app)
+    @app = app
+  end
+
+  def call(env)
+    puts 'middleware 2 --- before request'
+    response = @app.call(env)
+    puts 'middleware 2 --- after response'
+    response
+  end
+end
+
+# http://localhost:9292/hello_world
+use PutsMiddleware
+use PutsMiddleware2
+
+run ->(env) { APP.call(env) }
 ```
+
+我们可以看到输入的结果
+
+![rack-middleware](./photos/rack-middleware.png)
+
+可以得知, 中间件的执行是比较常见的先执行请求前, 后执行响应后.
+
+![rack middleware model](./photos/rack-middleware-model.png)
 
 ## puma
 
-puma-master\lib\puma\rack_default.rb
+[puma](https://puma.io/) 提供了一个非常快且并发的 HTTP 1.1 的服务器;
+puma 使用了 [Ragel](https://en.wikipedia.org/wiki/Ragel) 的拓展用于快速精准的解析 HTTP 1.1 协议;
+
+puma 的结构可以参考 [puma architecture](https://github.com/puma/puma/blob/master/docs/architecture.md)
+
+在上一节中, 我们提到了 rackup 最终的效果是
 
 ```rb
-require 'rack/handler/puma'
-
-module Rack::Handler
-  def self.default(options = {})
-    Rack::Handler::Puma
-  end
-end
+Rack::Handler::Puma.run(wrapped_app, **options, &block)
 ```
 
-puma-master\lib\rack\handler\puma.rb
-
-所有遵循 Rack 协议的 webserver 都会实现上述 .run 方法接受 app、options 和一个 block 作为参数运行一个进程来处理所有的来自用户的 HTTP 请求，在这里就是每个 webserver 自己需要解决的了
+那么, 我们现在去对应的代码看一下 `lib\rack\handler\puma.rb`
 
 ```rb
 require 'rack/handler'
@@ -340,29 +358,27 @@ module Rack
 end
 ```
 
-```
-bundle exec puma
-```
+这里的代码很简单, 就是把参数做一下处理, 然后传给 `Puma::Launcher` 去处理.
 
-常见的 rack 服务器
+在 Puma::Launcher 中有复杂的处理. 例如: 监听端口, 处理 http 请求等.
 
-- puma (rails 默认的 web server)
-- unicorn
-- webrick (rack 自带的)
+每一个 Puma 的进程将包括 `Puma::Server`的实例.
+每一个 `Puma::Server` 将有一个 调度器 (reactor) 和一个 线程池 (thread pool)
 
-https://en.wikipedia.org/wiki/Mastodon_(software)
+`Puma::Server`的实例从 socket 中拉取请求, 然后将请求添加到 `Puma::Reactor`.
 
-[puma](https://puma.io/)
+Reactor 中会分发请求, 并将请求封装成符合 Rack 要求的`env`对象;
 
-Puma was born from [Mongrel](<https://en.wikipedia.org/wiki/Mongrel_(web_server)>) and began moving forward.
-
-Unlike other Ruby Webservers, Puma was built for speed and parallelism. Puma is a small library that provides a very fast and concurrent HTTP 1.1 server for Ruby web applications. It is designed for running Rack apps only.
-
-What makes Puma so fast is the careful use of a [Ragel](https://en.wikipedia.org/wiki/Ragel) extension to provide fast, accurate HTTP 1.1 protocol parsing. This makes the server scream without too many portability issues.
+关于 puma 的内容很多,
+打算另写一篇文章, 分析一下 puma. 本文就不再过多的讲解了;
 
 ## rails
 
-rails 是基于 rack 的
+[Rails on Rack](https://guides.rubyonrails.org/rails_on_rack.html)
+
+```sh
+rails server
+```
 
 rails-6-1-stable\railties\lib\rails\cli.rb
 
@@ -372,10 +388,6 @@ rails-6-1-stable\railties\lib\rails\commands\server\server_command.rb
 def use_puma?
   server.to_s == "Rack::Handler::Puma"
 end
-```
-
-```sh
-rails server
 ```
 
 ## 总结
