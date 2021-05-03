@@ -2,8 +2,8 @@
 
 ## 背景
 
-2021 年 五一, 突然对 web server 产生了兴趣,
-好奇我们的程序是如何接收到请求, 找到我们的程序代码,并返回对应的结果的;
+2021 年 五一, 突然对 web server 与 rails 之间的关系,
+好奇我们的程序是如何接收到请求, 找到我们的业务程序代码, 并返回对应的结果的;
 
 于是, 便写下这篇文章;
 
@@ -376,21 +376,60 @@ Reactor 中会分发请求, 并将请求封装成符合 Rack 要求的`env`对�
 
 [Rails on Rack](https://guides.rubyonrails.org/rails_on_rack.html)
 
+我们看看 rails 是如何启动 web 服务器, 并让服务器与 rails 框架相结合的吧;
+
 ```sh
 rails server
 ```
 
-rails-6-1-stable\railties\lib\rails\cli.rb
-
-rails-6-1-stable\railties\lib\rails\commands\server\server_command.rb
+执行的是
+`railties\lib\rails\commands\server\server_command.rb` 中代码
 
 ```rb
-def use_puma?
-  server.to_s == "Rack::Handler::Puma"
+# Rails::Server 继承 ::Rack::Server
+Rails::Server.new(server_options).tap do |server|
+  Dir.chdir(Rails.application.root)
+  after_stop_callback = -> { say "Exiting" unless options[:daemon] }
+  # server对象会默认加载puma (rails 项目中的Gemfile 里默认有 puma)
+  # 同样会读取 config.ru 中的配置, 并启动server
+  server.start(after_stop_callback)
 end
 ```
 
+我们也可以使用 `rackup` 来启动一个 rails 服务
+
+```rb
+# Rails.root/config.ru
+require_relative "config/environment"
+# Rails.application is the primary Rack application object of a Rails application. Any Rack compliant web server should be using Rails.application object to serve a Rails application.
+run Rails.application
+```
+
+```sh
+# 查看 rails 使用的rack中间件
+rails middleware
+```
+
+```rb
+use ActionDispatch::HostAuthorization
+# ... 省略了很多
+use Rack::ETag
+use Rack::TempfileReaper
+# RailsProject 是我自己创建的一个rails项目的名称
+run RailsProject::Application.routes
+```
+
 ## 总结
+
+rack, puma, rails.
+
+Rack 协议是连接 web server 和 web 框架的桥梁.
+
+Puma 作为 web server 通过 rack 协议, 可以与 rails 框架很容易地集成起来;
+
+如果想更换 Rails 使用的 web server, 只需要简单的配置即可 (前提是需要符合 Rack 协议);
+
+Rails 框架中, 大量使用了 Rack 中间件.
 
 ## 参考文档
 
